@@ -1,6 +1,31 @@
-use axum::{Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
+use jsonwebtoken::{EncodingKey, Header, encode};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+#[derive(Deserialize)]
+struct AuthPayload {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    token: String,
+    user: store::models::User,
+}
+
+#[derive(Serialize)]
+struct JwtClaims {
+    sub: String,
+    exp: usize,
+}
 
 #[tokio::main]
 async fn main() {
@@ -15,17 +40,72 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health_check_handler))
+        .route("/signup", post(signup_handler))
+        .route("/signin", post(signin_handler))
         .with_state(pool);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
+    let server_addr = std::env::var("SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let listener = tokio::net::TcpListener::bind(&server_addr).await.unwrap();
+
+    println!("PERP Engine listening on http://{}", server_addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn signup_handler(
+    State(pool): State<PgPool>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<(StatusCode, Json<store::models::User>), (StatusCode, String)> {
+    if payload.username.trim().is_empty() || payload.password.len() < 6 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid username or password length".into(),
+        ));
+    }
+
+    match store::users::create_user(&pool, &payload.username, &payload.password).await {
+        Ok(user) => Ok((StatusCode::CREATED, Json(user))),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            Err((StatusCode::CONFLICT, "Username already exists".into()))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+async fn signin_handler(
+    State(pool): State<PgPool>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<Json<AuthResponse>, (StatusCode, String)> {
+    let user = store::users::find_user_by_username(&pool, &payload.username)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".into()))?;
+
+    if !store::users::verify_password(&payload.password, &user.password_hash) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".into()));
+    }
+
+    let claims = JwtClaims {
+        sub: user.username.clone(),
+        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret("super_secret_perp_key_change_me".as_ref()),
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Token generation failed".into(),
+        )
+    })?;
+
+    Ok(Json(AuthResponse { token, user }))
 }
 
 async fn health_check_handler(State(pool): State<PgPool>) -> &'static str {
     let check: Result<(i32,), _> = sqlx::query_as("SELECT 1").fetch_one(&pool).await;
-
     match check {
         Ok(_) => "OK",
         Err(_) => "DATABASE_UNHEALTHY",
