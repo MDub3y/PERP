@@ -1,0 +1,11 @@
+[package]
+name = "store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sqlx = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+rust_decimal ={ workspace = true}
+argon2 ={ workspace = true}
