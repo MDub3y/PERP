@@ -21,7 +21,7 @@ pub async fn create_user_with_deposit_address(
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
 
-    let user = sqlx::query_as::<_, User>(
+    let raw_user = sqlx::query_as::<_, User>(
         "INSERT INTO users (username, password_hash)
         VALUES ($1, $2)
         RETURNING id, username, password_hash, collateral_available, collateral_locked",
@@ -31,7 +31,7 @@ pub async fn create_user_with_deposit_address(
     .fetch_one(&mut *tx)
     .await?;
 
-    let affected = sqlx::query!(
+    let assigned_address = sqlx::query!(
         "UPDATE deposit_addresses
         SET user_id = $1, assigned_at = NOW()
         WHERE pubkey = (
@@ -39,19 +39,28 @@ pub async fn create_user_with_deposit_address(
             WHERE user_id IS NULL AND is_active = TRUE
             LIMIT 1
             FOR UPDATE SKIP LOCKED
-        )",
-        user.id
+        )
+        RETURNING pubkey",
+        raw_user.id
     )
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    if affected.rows_affected() == 0 {
-        return Err("Deposit key pool exhausted! Generate more addresses.".into());
-    }
+    let address_record = match assigned_address {
+        Some(record) => record,
+        None => return Err("Deposit key pool exhausted! Generate more addresses.".into()),
+    };
 
     tx.commit().await?;
 
-    Ok(user)
+    Ok(User {
+        id: raw_user.id,
+        username: raw_user.username,
+        password_hash: raw_user.password_hash,
+        collateral_available: raw_user.collateral_available,
+        collateral_locked: raw_user.collateral_locked,
+        pubkey: address_record.pubkey,
+    })
 }
 
 pub async fn find_user_by_username(
@@ -59,8 +68,16 @@ pub async fn find_user_by_username(
     username: &str,
 ) -> Result<Option<User>, sqlx::Error> {
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, username, password_hash, collateral_available, collateral_locked 
-         FROM users WHERE username = $1",
+        "SELECT
+            u.id,
+            u.username,
+            u.password_hash,
+            u.collateral_available,
+            u.collateral_locked,
+            d.pubkey
+        FROM users u
+        INNER JOIN DEPOSIT_ADDRESSES d ON u.id = d.user_id
+        WHERE u.username = $1",
     )
     .bind(username)
     .fetch_optional(pool)

@@ -9,4 +9,5 @@ pub struct User {
     pub password_hash: String,
     pub collateral_available: rust_decimal::Decimal,
     pub collateral_locked: rust_decimal::Decimal,
+    pub pubkey: String,
 }
