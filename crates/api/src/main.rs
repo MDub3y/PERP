@@ -62,12 +62,24 @@ async fn signup_handler(
         ));
     }
 
-    match store::users::create_user(&pool, &payload.username, &payload.password).await {
+    match store::users::create_user_with_deposit_address(
+        &pool,
+        &payload.username,
+        &payload.password,
+    )
+    .await
+    {
         Ok(user) => Ok((StatusCode::CREATED, Json(user))),
-        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-            Err((StatusCode::CONFLICT, "Username already exists".into()))
+        Err(err) => {
+            if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>() {
+                if let sqlx::Error::Database(db_err) = sqlx_err {
+                    if db_err.is_unique_violation() {
+                        return Err((StatusCode::CONFLICT, "Username already exists".into()));
+                    }
+                }
+            }
+            Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
