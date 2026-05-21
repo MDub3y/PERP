@@ -1,0 +1,11 @@
+[package]
+name = "seeder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }
+dotenvy = { workspace = true }
+bip39 = { workspace = true }
+solana-sdk = { workspace = true }
