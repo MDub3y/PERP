@@ -101,10 +101,12 @@ async fn signin_handler(
         exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
     };
 
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret("super_secret_perp_key_change_me".as_ref()),
+        &EncodingKey::from_secret(jwt_secret.as_ref()),
     )
     .map_err(|_| {
         (

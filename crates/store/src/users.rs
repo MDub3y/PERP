@@ -1,9 +1,7 @@
-use crate::models::User;
+use crate::models::{DbUser, User};
 use argon2::{
     Argon2,
-    password_hash::{
-        self, PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-    },
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -21,7 +19,7 @@ pub async fn create_user_with_deposit_address(
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
 
-    let raw_user = sqlx::query_as::<_, User>(
+    let raw_user = sqlx::query_as::<_, DbUser>(
         "INSERT INTO users (username, password_hash)
         VALUES ($1, $2)
         RETURNING id, username, password_hash, collateral_available, collateral_locked",
@@ -59,7 +57,7 @@ pub async fn create_user_with_deposit_address(
         password_hash: raw_user.password_hash,
         collateral_available: raw_user.collateral_available,
         collateral_locked: raw_user.collateral_locked,
-        pubkey: address_record.pubkey,
+        pubkey: Some(address_record.pubkey),
     })
 }
 
