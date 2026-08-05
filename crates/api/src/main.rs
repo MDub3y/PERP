@@ -1,3 +1,5 @@
+mod auth;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -8,6 +10,13 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+#[derive(Clone)]
+struct AppState {
+    pool: PgPool,
+    jwt_secret: String,
+    withdrawal_rate_limit_per_day: i64,
+}
 
 #[derive(Deserialize)]
 struct AuthPayload {
@@ -38,11 +47,23 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let withdrawal_rate_limit_per_day = std::env::var("WITHDRAWAL_RATE_LIMIT_PER_DAY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    let state = AppState {
+        pool,
+        jwt_secret,
+        withdrawal_rate_limit_per_day,
+    };
+
     let app = Router::new()
         .route("/health", get(health_check_handler))
         .route("/signup", post(signup_handler))
         .route("/signin", post(signin_handler))
-        .with_state(pool);
+        .with_state(state);
 
     let server_addr = std::env::var("SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&server_addr).await.unwrap();
@@ -52,7 +73,7 @@ async fn main() {
 }
 
 async fn signup_handler(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Json(payload): Json<AuthPayload>,
 ) -> Result<(StatusCode, Json<store::models::User>), (StatusCode, String)> {
     if payload.username.trim().is_empty() || payload.password.len() < 6 {
@@ -63,7 +84,7 @@ async fn signup_handler(
     }
 
     match store::users::create_user_with_deposit_address(
-        &pool,
+        &state.pool,
         &payload.username,
         &payload.password,
     )
@@ -84,10 +105,10 @@ async fn signup_handler(
 }
 
 async fn signin_handler(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Json(payload): Json<AuthPayload>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    let user = store::users::find_user_by_username(&pool, &payload.username)
+    let user = store::users::find_user_by_username(&state.pool, &payload.username)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".into()))?;
@@ -97,16 +118,14 @@ async fn signin_handler(
     }
 
     let claims = JwtClaims {
-        sub: user.username.clone(),
+        sub: user.id.to_string(),
         exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
     };
-
-    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
 
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(jwt_secret.as_ref()),
+        &EncodingKey::from_secret(state.jwt_secret.as_ref()),
     )
     .map_err(|_| {
         (
@@ -118,8 +137,8 @@ async fn signin_handler(
     Ok(Json(AuthResponse { token, user }))
 }
 
-async fn health_check_handler(State(pool): State<PgPool>) -> &'static str {
-    let check: Result<(i32,), _> = sqlx::query_as("SELECT 1").fetch_one(&pool).await;
+async fn health_check_handler(State(state): State<AppState>) -> &'static str {
+    let check: Result<(i32,), _> = sqlx::query_as("SELECT 1").fetch_one(&state.pool).await;
     match check {
         Ok(_) => "OK",
         Err(_) => "DATABASE_UNHEALTHY",
