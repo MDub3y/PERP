@@ -13,3 +13,5 @@ dotenvy = { workspace = true}
 store = { path = "../store" }
 jsonwebtoken ={ workspace = true}
 chrono = { workspace = true }
+solana-sdk = { workspace = true }
+rust_decimal = { workspace = true }

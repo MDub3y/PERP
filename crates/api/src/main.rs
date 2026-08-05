@@ -1,9 +1,11 @@
 mod auth;
+mod withdrawals;
 
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    middleware,
     routing::{get, post},
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -59,10 +61,21 @@ async fn main() {
         withdrawal_rate_limit_per_day,
     };
 
+    let protected = Router::new()
+        .route(
+            "/withdrawals",
+            post(withdrawals::request_withdrawal_handler),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     let app = Router::new()
         .route("/health", get(health_check_handler))
         .route("/signup", post(signup_handler))
         .route("/signin", post(signin_handler))
+        .merge(protected)
         .with_state(state);
 
     let server_addr = std::env::var("SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".into());
