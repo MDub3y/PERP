@@ -18,3 +18,12 @@ b. user spawns requests, and it succeeds to lock the balance after checking, may
 - For this, the two-phased commit is preferred: Ack based queues, 2 DB tables, and so on. 
 - Now in this also, if the worker sends a transaction to blockchain, and then fails to pop that req from the pending queue, so there should be a transaciton signature attached to the req in db, that can verfy the status.
 - there should be a limit on the number of requests a user can make for withdrawal in 24 hrs. 
+
+
+## Matching Engine
+- The PERP matching engine and orderbook has a few jobs.
+- Support Limit and Market orders(should support both IOC and partial fill) for LONG and SHORT orders.
+- also support Leverage orders.
+- implement the funding mechanism to ennsure PERP price doesn't drift far away from actual price.
+- Ensure that the limit orders placed are immediately added to the locked colleteral to prevent double spending. 
+- Implement efficient liquidation mechanism.

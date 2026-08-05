@@ -1,13 +1,14 @@
 # PERP Engine
 
-A centralized perpetuals exchange on Solana. Users hold a custodial balance managed by this backend; a matching engine (not yet built) would trade against that balance. This document covers only what currently exists in the codebase.
+A centralized perpetuals exchange on Solana. Users hold a custodial balance managed by this backend and trade it against an in-memory matching engine. This document covers only what currently exists in the codebase.
 
 ## Workspace layout
 
-- `crates/api` — public HTTP API (axum). Signup/signin, JWT auth, withdrawal requests.
-- `crates/store` — shared Postgres data-access layer (sqlx), used by both `api` and `worker`.
+- `crates/api` — public HTTP API (axum). Signup/signin, JWT auth, withdrawal requests, order placement/cancel, positions.
+- `crates/store` — shared Postgres data-access layer (sqlx), used by `api`, `worker`, and `engine`.
 - `crates/worker` — background process that owns the fat-wallet signing key, drains the withdrawal queue, and talks to Solana. Never exposed to the network.
-- `crates/seeder` — one-off bootstrap scripts: deposit-address pool generation, fat-wallet + durable-nonce pool creation.
+- `crates/engine` — the matching engine: in-memory order book, margin/leverage, funding, tiered fees, and liquidation. Owns no signing key and is never exposed to the network either.
+- `crates/seeder` — one-off bootstrap scripts: deposit-address pool generation, fat-wallet + durable-nonce pool creation, market config seeding.
 
 ## Custodial account model
 
@@ -53,17 +54,39 @@ QUEUED -> SUBMITTING -> SUBMITTED -> CONFIRMED
     \-----------------------> REFUNDED
 ```
 
+## Matching Engine
+
+The engine (`crates/engine`) is a separate process from `api`, matching orders in memory for speed while Postgres stays the durable source of truth for balances. It reuses the withdrawal pipeline's pattern throughout: transactional outbox → Redis Streams relay → consumer-group processing → idempotent guarded state transitions.
+
+**Consistency model:** margin is reserved in Postgres *before* the engine ever sees an order (`POST /orders` → `store::orders::place_order`, one transaction: row-lock the user, check + debit `collateral_available` → `collateral_locked`, insert the `orders` row + an `orders_outbox` row). The engine's relay drains that outbox onto a Redis stream; the engine matches in memory; every balance-affecting outcome (fill, fee, funding, liquidation transfer) is appended to a second stream, `engine:events`, which an independent ledger-writer consumer applies back to Postgres as small guarded transactions. Postgres balances therefore converge with bounded lag (normally sub-second) rather than being touched on the matching hot path at all.
+
+**Orders:** LIMIT and MARKET, GTC or IOC, LONG or SHORT, reduce-only, cross or isolated margin. LIMIT+GTC rests on the book if unfilled; LIMIT+IOC and MARKET (always treated as IOC) fill what they can and drop the remainder. The book is a per-market `BTreeMap<price, VecDeque<order>>` (price-time priority), matched against `rust_decimal::Decimal` directly rather than a custom fixed-point type — simpler, and this codebase already leans on `Decimal` everywhere else.
+
+**Fees:** tiered maker/taker rates by trailing 30-day volume (`fee_tiers`, refreshed once per UTC day), applied inline per fill so `engine:events` fill records already carry final amounts. The top tier's maker rate is negative — a plain sign-flipped transfer handles the rebate, no special-cased branch.
+
+**Funding:** a 5-second sampler walks the book for the bid/ask VWAP that would fill `impact_notional`, computes the premium index against the mark price, and writes to the `funding_rate_samples` hypertable. Once per UTC hour, `mean_P` over the trailing window is turned into `FR_hour` per the standard 8-hour-formula-divided-by-8 approach and settled against every open position, credited/debited directly to `collateral_available` and tracked in `positions.funding_pnl` separately from trading PnL.
+
+**Liquidation:** margin health (`Equity` vs `MaintenanceMargin`) is polled every 3 seconds rather than recomputed synchronously on every fill — a deliberate simplification of "continuous". Cross evaluates an account's combined cross exposure; isolated evaluates one position independently. A flagged scope is blocked from new order intake (checked in-memory, no Postgres round-trip) and unwound with engine-generated reduce-only IOC orders. If the book can't absorb an unwind and equity has fallen to a small fraction of maintenance margin, the remaining position is transferred directly to the insurance-fund account instead (`backstop_equity_ratio`, per-market). Liquidation fills carry an extra `liquidation_fee_rate` surcharge on top of the normal taker rate.
+
+**Mark/index price:** the engine's own last-trade price, mirrored to `markets.mark_price` so `place_order` can size MARKET-order margin without depending on the engine being reachable. There is no external oracle in this codebase — this is a documented stub; Pyth would be the natural integration given the stack is already Solana-native.
+
+**Crash recovery:** the match-loop task snapshots its full state (books, positions, fee/mark-price caches, event/trade id counters) to Postgres every 10 seconds. On restart it loads the latest snapshot and resumes — no replay from the event log — so at most ~10 seconds of activity is lost on a crash, a bound accepted up front rather than engineered around.
+
+**Pub/sub:** Redis Streams (`engine:events`) is durable history; Redis Pub/Sub is a separate, ephemeral live feed of the same facts — public per-market channels (`market:{SYMBOL}:trades|book|ticker`) and a private per-user channel (`user:{id}:orders`, `ACCEPTED`/`FILL`/`RESTED`/`CANCELED`/`REJECTED`) so a client can watch its own order resolve in real time instead of reloading. No consumer of these channels exists yet — a WebSocket gateway bridging them to browsers is the next piece, not built here.
+
 ## Running locally
 
 ```
-docker compose up -d              # postgres, redis, local solana validator
+docker compose up -d                      # postgres (timescaledb), redis, local solana validator
 cargo run -p seeder --bin seeder          # populate the deposit-address pool
 cargo run -p seeder --bin fund_fatwallet  # fund the fat wallet + create the nonce pool
-cargo run -p api                  # public API
-cargo run -p worker               # withdrawal processor
+cargo run -p seeder --bin seed_markets    # seed SOL/ETH/BTC market config
+cargo run -p api                          # public API
+cargo run -p worker                       # withdrawal processor
+cargo run -p engine                       # matching engine
 ```
 
-Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY` (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5).
+Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY` (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5); `DATABASE_URL`, `REDIS_URL`, `ENGINE_INTAKE_CONCURRENCY` (engine, default 2).
 
 The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer agave/solana images require `io_uring`, which WSL2's kernel does not support, and `solana-test-validator` panics on startup there.
 
@@ -75,9 +98,15 @@ The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer ag
 | `POST /signup` | none | Create a user, assign a deposit address |
 | `POST /signin` | none | Returns a JWT |
 | `POST /withdrawals` | bearer JWT | Queue a withdrawal (`amount`, `destination_pubkey`) |
+| `POST /orders` | bearer JWT | Place an order (`market`, `variant`, `order_type`, `tif`, `reduce_only`, `leverage`, `margin_mode`, `price`, `quantity`) |
+| `DELETE /orders/{id}` | bearer JWT | Cancel an open order, refunding unfilled margin |
+| `GET /orders` | bearer JWT | List the caller's open orders |
+| `GET /positions` | bearer JWT | List the caller's open positions |
 
 ## Not yet built
 
 - Deposit indexing (crediting `collateral_available` from on-chain transfers)
 - Sweeping deposit-address balances into the fat wallet
-- Order placement, order book, matching engine, positions/margin logic (the `orders`/`positions` tables exist in the schema but no code touches them)
+- External price oracle (mark/index price is currently the engine's own last-trade price — see Matching Engine)
+- WebSocket gateway bridging the engine's Redis Pub/Sub channels to browser clients
+- Cross liquidation currently unwinds the first open position it finds rather than largest-notional-first
