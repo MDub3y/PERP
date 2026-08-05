@@ -9,3 +9,4 @@ sqlx = { workspace = true }
 dotenvy = { workspace = true }
 bip39 = { workspace = true }
 solana-sdk = { workspace = true }
+solana-client = { workspace = true }

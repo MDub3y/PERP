@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -13,5 +11,30 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: perp_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  solana-test-validator:
+    # Pinned to the v1.x line: newer agave/solana releases require io_uring
+    # in solana-accounts-db, which WSL2's kernel does not support, so
+    # solana-test-validator panics on startup under Docker Desktop/WSL2.
+    image: solanalabs/solana:v1.18.26
+    container_name: perp_validator
+    entrypoint: ["solana-test-validator"]
+    command: ["--reset", "--rpc-port", "8899"]
+    ports:
+      - "8899:8899" # JSON-RPC
+      - "8900:8900" # websocket (subscriptions)
+    volumes:
+      - validator-ledger:/root/.local/share/solana/install/active_release/bin
+
 volumes:
   pgdata:
+  redisdata:
+  validator-ledger:
