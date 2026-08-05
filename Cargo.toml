@@ -3,7 +3,8 @@ members = [
     "crates/api",
     "crates/store",
     "crates/seeder",
-    "crates/worker"
+    "crates/worker",
+    "crates/engine"
 ]
 resolver = "3"
 
