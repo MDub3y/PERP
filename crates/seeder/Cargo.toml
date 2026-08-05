@@ -10,3 +10,4 @@ dotenvy = { workspace = true }
 bip39 = { workspace = true }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
+rust_decimal = { workspace = true }
