@@ -1,4 +1,5 @@
 mod auth;
+mod orders;
 mod withdrawals;
 
 use axum::{
@@ -6,7 +7,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,10 @@ async fn main() {
             "/withdrawals",
             post(withdrawals::request_withdrawal_handler),
         )
+        .route("/orders", post(orders::place_order_handler))
+        .route("/orders", get(orders::list_orders_handler))
+        .route("/orders/{id}", delete(orders::cancel_order_handler))
+        .route("/positions", get(orders::list_positions_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
