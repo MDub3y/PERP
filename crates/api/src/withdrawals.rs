@@ -47,3 +47,13 @@ pub async fn request_withdrawal_handler(
         }
     }
 }
+
+pub async fn list_withdrawals_handler(
+    State(state): State<AppState>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+) -> Result<Json<Vec<store::models::WithdrawalRequest>>, (StatusCode, String)> {
+    store::withdrawals::fetch_withdrawals_for_user(&state.pool, user_id)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}

@@ -1,9 +1,10 @@
 mod auth;
+mod markets;
 mod orders;
 mod withdrawals;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::State,
     http::StatusCode,
     middleware,
@@ -12,6 +13,8 @@ use axum::{
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+
+use auth::AuthUser;
 use sqlx::postgres::PgPoolOptions;
 
 #[derive(Clone)]
@@ -63,10 +66,12 @@ async fn main() {
     };
 
     let protected = Router::new()
+        .route("/me", get(me_handler))
         .route(
             "/withdrawals",
             post(withdrawals::request_withdrawal_handler),
         )
+        .route("/withdrawals", get(withdrawals::list_withdrawals_handler))
         .route("/orders", post(orders::place_order_handler))
         .route("/orders", get(orders::list_orders_handler))
         .route("/orders/{id}", delete(orders::cancel_order_handler))
@@ -80,6 +85,7 @@ async fn main() {
         .route("/health", get(health_check_handler))
         .route("/signup", post(signup_handler))
         .route("/signin", post(signin_handler))
+        .route("/markets", get(markets::list_markets_handler))
         .merge(protected)
         .with_state(state);
 
@@ -153,6 +159,17 @@ async fn signin_handler(
     })?;
 
     Ok(Json(AuthResponse { token, user }))
+}
+
+async fn me_handler(
+    State(state): State<AppState>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+) -> Result<Json<store::models::User>, (StatusCode, String)> {
+    store::users::fetch_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "User not found".into()))
 }
 
 async fn health_check_handler(State(state): State<AppState>) -> &'static str {
