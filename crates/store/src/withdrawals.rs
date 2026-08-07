@@ -94,6 +94,18 @@ pub async fn request_withdrawal(
     Ok(request)
 }
 
+pub async fn fetch_withdrawals_for_user(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<Vec<WithdrawalRequest>, sqlx::Error> {
+    sqlx::query_as::<_, WithdrawalRequest>(
+        "SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
 // ---- transactional-outbox relay support ----
 
 pub async fn fetch_unprocessed_outbox_events(

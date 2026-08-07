@@ -84,6 +84,26 @@ pub async fn find_user_by_username(
     Ok(user)
 }
 
+pub async fn fetch_user_by_id(pool: &PgPool, id: i32) -> Result<Option<User>, sqlx::Error> {
+    let user = sqlx::query_as::<_, User>(
+        "SELECT
+            u.id,
+            u.username,
+            u.password_hash,
+            u.collateral_available,
+            u.collateral_locked,
+            d.pubkey
+        FROM users u
+        INNER JOIN DEPOSIT_ADDRESSES d ON u.id = d.user_id
+        WHERE u.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(user)
+}
+
 pub fn verify_password(password_plain: &str, password_hash: &str) -> bool {
     let parsed_hash = match PasswordHash::new(password_hash) {
         Ok(h) => h,
