@@ -2,13 +2,21 @@
 
 A centralized perpetuals exchange on Solana. Users hold a custodial balance managed by this backend and trade it against an in-memory matching engine. This document covers only what currently exists in the codebase.
 
+## Architecture
+
+![PERP engine system architecture: browser to axum API and ws-gateway, Postgres as source of truth, Redis Streams relaying the transactional outbox to the engine and worker, Redis Pub/Sub fanning out live updates, worker settling withdrawals against Solana](docs/architecture.svg)
+
+Postgres is the only source of truth. The API commits state there synchronously (blue); a transactional outbox is relayed onto Redis Streams for the engine and worker to consume asynchronously (orange); the engine additionally fans out live book/trade/order updates over Redis Pub/Sub, which `ws-gateway` relays to the browser (violet); the worker settles withdrawals against Solana directly (red). See the `## Workspace layout`, `## Withdrawals`, and `## Matching Engine` sections below for the mechanism behind each hop.
+
 ## Workspace layout
 
-- `crates/api` — public HTTP API (axum). Signup/signin, JWT auth, withdrawal requests, order placement/cancel, positions.
+- `crates/api` — public HTTP API (axum). Signup/signin, JWT auth, withdrawal requests, order placement/cancel, positions, market listing.
 - `crates/store` — shared Postgres data-access layer (sqlx), used by `api`, `worker`, and `engine`.
 - `crates/worker` — background process that owns the fat-wallet signing key, drains the withdrawal queue, and talks to Solana. Never exposed to the network.
 - `crates/engine` — the matching engine: in-memory order book, margin/leverage, funding, tiered fees, and liquidation. Owns no signing key and is never exposed to the network either.
+- `crates/ws-gateway` — bridges the engine's Redis Pub/Sub channels (`market:{SYMBOL}:trades|book|ticker`, `user:{id}:orders`) to browser WebSocket clients. Stateless relay: no DB access, no signing key.
 - `crates/seeder` — one-off bootstrap scripts: deposit-address pool generation, fat-wallet + durable-nonce pool creation, market config seeding.
+- `frontend` — minimal Next.js (App Router, TypeScript, Zustand, Tailwind) trading UI: auth, a trade page (chart, book, trades, order entry, open orders, positions), and a wallet page (withdrawals).
 
 ## Custodial account model
 
@@ -84,9 +92,12 @@ cargo run -p seeder --bin seed_markets    # seed SOL/ETH/BTC market config
 cargo run -p api                          # public API
 cargo run -p worker                       # withdrawal processor
 cargo run -p engine                       # matching engine
+cargo run -p ws-gateway                   # WebSocket bridge for live market/order data
+
+cd frontend && cp .env.local.example .env.local && npm install && npm run dev  # trading UI, http://localhost:3002
 ```
 
-Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY` (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5); `DATABASE_URL`, `REDIS_URL`, `ENGINE_INTAKE_CONCURRENCY` (engine, default 2).
+Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY` (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5); `DATABASE_URL`, `REDIS_URL`, `ENGINE_INTAKE_CONCURRENCY` (engine, default 2); `REDIS_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (ws-gateway, default `127.0.0.1:3001` — must share the same `JWT_SECRET` as `api`). `frontend/.env.local`: `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_WS_URL`.
 
 The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer agave/solana images require `io_uring`, which WSL2's kernel does not support, and `solana-test-validator` panics on startup there.
 
@@ -97,16 +108,28 @@ The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer ag
 | `GET /health` | none | DB connectivity check |
 | `POST /signup` | none | Create a user, assign a deposit address |
 | `POST /signin` | none | Returns a JWT |
+| `GET /markets` | none | List market config (tick/lot size, max leverage, mark price, ...) |
+| `GET /me` | bearer JWT | Caller's balances (`collateral_available`, `collateral_locked`) |
 | `POST /withdrawals` | bearer JWT | Queue a withdrawal (`amount`, `destination_pubkey`) |
+| `GET /withdrawals` | bearer JWT | List the caller's withdrawal requests, newest first |
 | `POST /orders` | bearer JWT | Place an order (`market`, `variant`, `order_type`, `tif`, `reduce_only`, `leverage`, `margin_mode`, `price`, `quantity`) |
 | `DELETE /orders/{id}` | bearer JWT | Cancel an open order, refunding unfilled margin |
 | `GET /orders` | bearer JWT | List the caller's open orders |
 | `GET /positions` | bearer JWT | List the caller's open positions |
+
+## WebSocket gateway (`crates/ws-gateway`)
+
+Bridges the engine's Redis Pub/Sub channels to browser clients — a thin relay with no DB access and no signing key.
+
+| Route | Auth | Forwards |
+|---|---|---|
+| `GET /ws/market/{symbol}` | none | `market:{SYMBOL}:trades\|book\|ticker` as `{"channel": "trades"\|"book"\|"ticker", "data": ...}` frames |
+| `GET /ws/user?token=<jwt>` | JWT in query param (browsers can't set `Authorization` on a WS upgrade) | `user:{id}:orders` as `{"channel": "orders", "data": ...}` frames |
 
 ## Not yet built
 
 - Deposit indexing (crediting `collateral_available` from on-chain transfers)
 - Sweeping deposit-address balances into the fat wallet
 - External price oracle (mark/index price is currently the engine's own last-trade price — see Matching Engine)
-- WebSocket gateway bridging the engine's Redis Pub/Sub channels to browser clients
+- Order book depth in the UI/gateway — the engine only publishes best bid/ask (`publish_book_top`), not full depth, so `/ws/market/{symbol}` and the frontend show top-of-book only
 - Cross liquidation currently unwinds the first open position it finds rather than largest-notional-first
