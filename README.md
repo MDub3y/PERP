@@ -101,6 +101,16 @@ Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`
 
 The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer agave/solana images require `io_uring`, which WSL2's kernel does not support, and `solana-test-validator` panics on startup there.
 
+### Smoke-testing the full flow
+
+Everything above is built and passes its own layer of checks (`cargo check`/`clippy`, `tsc --noEmit`, `eslint`, `next build`), but wiring six live processes together (`postgres`, `redis`, `solana-test-validator`, `api`, `worker`, `engine`, `ws-gateway`, `frontend`) hasn't been exercised end-to-end against a live stack in this environment. To verify it yourself, after the steps above are all running:
+
+1. Open `http://localhost:3002`, sign up, and confirm you land on `/trade/SOL` with a nonzero deposit address assigned (check the `users`/`deposit_addresses` tables, or add a `GET /me` call — the UI shows balances in the navbar).
+2. Place a LIMIT order — confirm it appears in "Open orders", the navbar's `collateral_locked` increases, and a browser WS frame arrives on `/ws/user` (`ACCEPTED`/`RESTED`).
+3. From a second signed-up account, place a crossing order on the same market and confirm both sides show a `FILL` order event, "Positions" populates on both accounts, and the trade appears in the recent-trades feed on `/trade/SOL` (`market:SOL:trades` over `/ws/market/SOL`).
+4. Cancel a resting order — confirm `collateral_locked` is refunded back to `collateral_available`.
+5. Request a withdrawal — confirm it shows `QUEUED` in `/wallet`, then progresses through the worker's states (`SUBMITTING`/`SUBMITTED`/`CONFIRMED`) as `crates/worker` processes it against the local validator.
+
 ## API
 
 | Route | Auth | Description |
