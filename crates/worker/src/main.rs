@@ -1,13 +1,9 @@
-mod consumer;
-mod processor;
-mod reconciler;
-mod relay;
-mod wallet;
-
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::signer::Signer;
 use sqlx::postgres::PgPoolOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use worker::{consumer, deposit_indexer, reconciler, relay, sweeper, wallet};
 
 const STREAM_KEY: &str = "withdrawals:queue";
 const GROUP_NAME: &str = "withdrawal-workers";
@@ -33,14 +29,16 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
+    let mnemonic_path = PathBuf::from("keys/mnemonic.txt");
     let fat_wallet = Arc::new(
         wallet::load_fat_wallet_keypair(Path::new("keys/mnemonic.txt"))
             .expect("Failed to derive fat wallet keypair"),
     );
+    let fat_wallet_pubkey = fat_wallet.pubkey();
     let rpc = Arc::new(RpcClient::new(solana_rpc_url));
     let redis_client = redis::Client::open(redis_url).expect("Invalid REDIS_URL");
 
-    tracing::info!("worker starting, fat wallet pubkey = {}", solana_sdk::signer::Signer::pubkey(fat_wallet.as_ref()));
+    tracing::info!("worker starting, fat wallet pubkey = {}", fat_wallet_pubkey);
 
     let mut handles = Vec::new();
 
@@ -66,6 +64,18 @@ async fn main() {
         pool.clone(),
         rpc.clone(),
         fat_wallet.clone(),
+    )));
+
+    handles.push(tokio::spawn(deposit_indexer::run_deposit_indexer(
+        pool.clone(),
+        rpc.clone(),
+    )));
+
+    handles.push(tokio::spawn(sweeper::run_sweeper(
+        pool.clone(),
+        rpc.clone(),
+        mnemonic_path.clone(),
+        fat_wallet_pubkey,
     )));
 
     for handle in handles {

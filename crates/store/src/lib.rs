@@ -1,3 +1,4 @@
+pub mod deposits;
 pub mod ledger;
 pub mod markets;
 pub mod models;

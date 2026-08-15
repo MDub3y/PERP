@@ -1,7 +1,7 @@
 use crate::book::OrderBook;
 use crate::events::publish_event;
 use crate::matcher::{self, MatchFill, MatchOutcome};
-use crate::publish::{publish_book_top, publish_ticker, publish_trade, publish_user_order_event};
+use crate::publish::{publish_book_top, publish_depth, publish_ticker, publish_trade, publish_user_order_event};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,11 @@ use tokio::sync::mpsc;
 /// as the tradeoff for keeping the hot path entirely in-memory/Redis-speed
 /// (no replay-from-event-log on recovery; see bootstrap()).
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Number of price levels per side published on the `market:{SYM}:depth`
+/// channel - deep enough for a UI depth ladder without dumping the whole
+/// book on every mutation.
+const DEPTH_LEVELS: usize = 10;
 
 pub enum IntakeCommand {
     NewOrder(Order),
@@ -36,6 +41,11 @@ pub enum IntakeCommand {
     /// mark-price tick (a documented simplification - "continuous" per the
     /// spec becomes "polled every few seconds" here); see check_liquidations.
     CheckLiquidations,
+    /// Sent by oracle::run_oracle_poller whenever a fresh Pyth Hermes price
+    /// lands for a market. Purely in-memory - unlike mark_price this is
+    /// never persisted, since it's a live external feed, not a fact this
+    /// engine established itself.
+    UpdateIndexPrice { market: MarketSymbol, price: Decimal },
 }
 
 /// Owns every market's order book plus a lightweight net-position-quantity
@@ -59,6 +69,14 @@ struct EngineState {
     /// exists in this codebase). A stub for a future oracle integration
     /// (Pyth is the natural fit, already Solana-native) - see README.
     mark_prices: HashMap<MarketSymbol, Decimal>,
+    /// External index price (Pyth Hermes), fed by oracle::run_oracle_poller
+    /// via IntakeCommand::UpdateIndexPrice. Ephemeral - never persisted or
+    /// included in snapshots, since it's re-fetched from Pyth on every
+    /// restart within seconds. Distinct from `mark_prices` (this engine's
+    /// own book-derived last-trade price): funding's premium calc wants
+    /// Index = oracle, Mark = book, which this split now makes possible.
+    #[serde(skip)]
+    index_prices: HashMap<MarketSymbol, Decimal>,
     /// Scopes currently blocked from new order intake: `(user_id, None)` is
     /// an account-wide cross flag, `(user_id, Some(market))` is a
     /// single-market isolated flag. Checked synchronously on every
@@ -224,6 +242,7 @@ async fn bootstrap_from_postgres(pool: &PgPool) -> EngineState {
         fee_rates,
         markets,
         mark_prices,
+        index_prices: HashMap::new(),
         liquidating_scopes,
         next_event_id: last_event_id + 1,
         next_trade_id: max_trade_id.unwrap_or(0) + 1,
@@ -267,10 +286,10 @@ pub async fn run_match_loop(
                         handle_new_order(&mut state, &pool, &mut events_conn, &events_stream_key, order).await;
                     }
                     IntakeCommand::CancelOrder { order_id, market } => {
-                        if let Some(book) = state.books.get_mut(&market) {
-                            if book.remove_by_id(order_id).is_some() {
-                                tracing::info!("removed cancelled order {order_id} from {market:?} book");
-                            }
+                        let removed = state.books.get_mut(&market).is_some_and(|book| book.remove_by_id(order_id).is_some());
+                        if removed {
+                            tracing::info!("removed cancelled order {order_id} from {market:?} book");
+                            publish_book_update(&state, &mut events_conn, market).await;
                         }
                     }
                     IntakeCommand::ReloadFeeTiers(fee_tiers) => {
@@ -285,6 +304,9 @@ pub async fn run_match_loop(
                     }
                     IntakeCommand::CheckLiquidations => {
                         check_liquidations(&mut state, &pool, &mut events_conn, &events_stream_key).await;
+                    }
+                    IntakeCommand::UpdateIndexPrice { market, price } => {
+                        state.index_prices.insert(market, price);
                     }
                 }
             }
@@ -319,13 +341,13 @@ fn take_snapshot(state: &EngineState, pool: &PgPool) {
 
 /// Samples the premium index for every market: walk the book for the
 /// bid/ask VWAP that would fill `impact_notional`, falling back to Index
-/// (mark price - see the `mark_prices` doc comment) with zero contribution
-/// on whichever side can't fill it. Fire-and-forget DB write, same pattern
-/// as take_snapshot, so the match loop never blocks on it.
+/// (the Pyth oracle price - see the `index_prices` doc comment) with zero
+/// contribution on whichever side can't fill it. Fire-and-forget DB write,
+/// same pattern as take_snapshot, so the match loop never blocks on it.
 fn sample_funding(state: &EngineState, pool: &PgPool) {
     for (&market, book) in &state.books {
-        let Some(index) = state.mark_prices.get(&market).copied() else {
-            continue; // no mark price yet, nothing to sample against
+        let Some(index) = state.index_prices.get(&market).copied() else {
+            continue; // no Pyth index price yet (cold start before first poll)
         };
         let Some(market_cfg) = state.markets.get(&market) else { continue };
 
@@ -510,14 +532,24 @@ async fn handle_new_order(
         .await;
     }
 
-    if !outcome.fills.is_empty() {
-        let top = state.books.get(&order.market).map(|b| (b.best_bid(), b.best_ask()));
-        if let Some((bid, ask)) = top {
-            publish_book_top(events_conn, order.market, bid, ask).await;
-        }
+    // Resting a new order or filling against the book both change depth,
+    // even when no fill occurred (a GTC LIMIT resting untouched still adds
+    // liquidity) - so this fires on either, not fill-only like the old
+    // top-of-book-only publish did.
+    if !outcome.fills.is_empty() || outcome.rested_order_id.is_some() {
+        publish_book_update(state, events_conn, order.market).await;
     }
 
     Some(outcome)
+}
+
+/// Publishes both the best-bid/ask and full depth snapshot for a market
+/// right after its book was mutated (new order, fill, or cancel).
+async fn publish_book_update(state: &EngineState, events_conn: &mut redis::aio::MultiplexedConnection, market: MarketSymbol) {
+    let Some(book) = state.books.get(&market) else { return };
+    publish_book_top(events_conn, market, book.best_bid(), book.best_ask()).await;
+    let (bids, asks) = book.depth(DEPTH_LEVELS);
+    publish_depth(events_conn, market, &bids, &asks).await;
 }
 
 async fn reject_order(
@@ -652,6 +684,23 @@ async fn emit_fill_event(
 // IntakeCommand::CheckLiquidations.
 // ============================================================
 
+/// Picks which of `user_id`'s open cross positions to unwind first: the one
+/// with the largest absolute notional (`|qty| * mark_price`). A position
+/// with no mark price yet is treated as zero notional (never picked ahead
+/// of one that does have a price) rather than panicking or being skipped
+/// entirely, so unwinding still makes progress.
+fn largest_notional_position(
+    positions: &HashMap<(i32, MarketSymbol), Decimal>,
+    mark_prices: &HashMap<MarketSymbol, Decimal>,
+    user_id: i32,
+) -> Option<MarketSymbol> {
+    positions
+        .iter()
+        .filter(|&(&(u, _), &qty)| u == user_id && qty != Decimal::ZERO)
+        .max_by_key(|&(&(_, m), &qty)| qty.abs() * mark_prices.get(&m).copied().unwrap_or(Decimal::ZERO))
+        .map(|(&(_, m), _)| m)
+}
+
 async fn check_liquidations(
     state: &mut EngineState,
     pool: &PgPool,
@@ -696,14 +745,7 @@ async fn check_liquidations(
         .collect();
 
     for user_id in cross_flagged_users {
-        // Picks the first open cross position found - a documented
-        // simplification of "largest notional first"; the next tick picks
-        // up whatever's left if this account has more than one.
-        let market = state
-            .positions
-            .iter()
-            .find(|&(&(u, _), &qty)| u == user_id && qty != Decimal::ZERO)
-            .map(|(&(_, m), _)| m);
+        let market = largest_notional_position(&state.positions, &state.mark_prices, user_id);
         let Some(market) = market else { continue };
         let (equity, mm) = cross_health.get(&user_id).copied().unwrap_or((Decimal::ZERO, Decimal::ZERO));
         unwind_scope(state, pool, events_conn, events_stream_key, user_id, market, equity, mm).await;
@@ -905,4 +947,58 @@ async fn trigger_insurance_backstop(
     state.liquidating_scopes.remove(&(user_id, Some(market)));
 
     tracing::error!("INSURANCE FUND BACKSTOP triggered for user {user_id} market {market:?} at mark_price={mark_price}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn largest_notional_position_picks_biggest_notional_not_first_found() {
+        let mut positions = HashMap::new();
+        positions.insert((1, MarketSymbol::Sol), d("1")); // 1 * 100 = 100 notional
+        positions.insert((1, MarketSymbol::Eth), d("10")); // 10 * 50 = 500 notional (largest)
+        positions.insert((1, MarketSymbol::Btc), d("0.1")); // 0.1 * 1000 = 100 notional
+        positions.insert((2, MarketSymbol::Eth), d("100")); // other user, must be ignored
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert(MarketSymbol::Sol, d("100"));
+        mark_prices.insert(MarketSymbol::Eth, d("50"));
+        mark_prices.insert(MarketSymbol::Btc, d("1000"));
+
+        assert_eq!(largest_notional_position(&positions, &mark_prices, 1), Some(MarketSymbol::Eth));
+    }
+
+    #[test]
+    fn largest_notional_position_ignores_zero_quantity_positions() {
+        let mut positions = HashMap::new();
+        positions.insert((1, MarketSymbol::Sol), Decimal::ZERO);
+        positions.insert((1, MarketSymbol::Eth), d("1"));
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert(MarketSymbol::Eth, d("50"));
+
+        assert_eq!(largest_notional_position(&positions, &mark_prices, 1), Some(MarketSymbol::Eth));
+    }
+
+    #[test]
+    fn largest_notional_position_missing_mark_price_treated_as_zero_not_panicking() {
+        let mut positions = HashMap::new();
+        positions.insert((1, MarketSymbol::Sol), d("5")); // no mark price -> zero notional
+        positions.insert((1, MarketSymbol::Eth), d("1")); // has a mark price -> nonzero, wins
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert(MarketSymbol::Eth, d("50"));
+
+        assert_eq!(largest_notional_position(&positions, &mark_prices, 1), Some(MarketSymbol::Eth));
+    }
+
+    #[test]
+    fn largest_notional_position_no_open_positions_returns_none() {
+        let positions = HashMap::new();
+        let mark_prices = HashMap::new();
+        assert_eq!(largest_notional_position(&positions, &mark_prices, 1), None);
+    }
 }

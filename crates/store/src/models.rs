@@ -38,6 +38,16 @@ pub struct OutboxEvent {
 }
 
 #[derive(Debug, FromRow, Serialize)]
+pub struct Deposit {
+    pub id: i32,
+    pub user_id: i32,
+    pub pubkey: String,
+    pub signature: String,
+    pub amount: rust_decimal::Decimal,
+    pub indexed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, FromRow, Serialize)]
 pub struct DbUser {
     pub id: i32,
     pub username: String,
@@ -189,6 +199,7 @@ pub struct Market {
     pub is_active: bool,
     pub mark_price: Option<rust_decimal::Decimal>,
     pub mark_price_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pyth_price_feed_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

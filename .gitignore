@@ -2,3 +2,6 @@
 .env
 keys/
 .claude
+# symlink to frontend/node_modules so tests/frontend's vitest config can
+# resolve @vitejs/plugin-react etc. despite living outside frontend/
+/tests/node_modules

@@ -12,11 +12,12 @@ Postgres is the only source of truth. The API commits state there synchronously 
 
 - `crates/api` — public HTTP API (axum). Signup/signin, JWT auth, withdrawal requests, order placement/cancel, positions, market listing.
 - `crates/store` — shared Postgres data-access layer (sqlx), used by `api`, `worker`, and `engine`.
-- `crates/worker` — background process that owns the fat-wallet signing key, drains the withdrawal queue, and talks to Solana. Never exposed to the network.
-- `crates/engine` — the matching engine: in-memory order book, margin/leverage, funding, tiered fees, and liquidation. Owns no signing key and is never exposed to the network either.
-- `crates/ws-gateway` — bridges the engine's Redis Pub/Sub channels (`market:{SYMBOL}:trades|book|ticker`, `user:{id}:orders`) to browser WebSocket clients. Stateless relay: no DB access, no signing key.
+- `crates/worker` — background process that owns the fat-wallet signing key, drains the withdrawal queue, indexes incoming deposits, sweeps deposit addresses into the fat wallet, and talks to Solana. Never exposed to the network.
+- `crates/engine` — the matching engine: in-memory order book (incl. depth), margin/leverage, funding (fed by a Pyth oracle poller), tiered fees, and liquidation. Owns no signing key and is never exposed to the network either.
+- `crates/ws-gateway` — bridges the engine's Redis Pub/Sub channels (`market:{SYMBOL}:trades|book|ticker|depth`, `user:{id}:orders`) to browser WebSocket clients. Stateless relay: no DB access, no signing key.
 - `crates/seeder` — one-off bootstrap scripts: deposit-address pool generation, fat-wallet + durable-nonce pool creation, market config seeding.
-- `frontend` — minimal Next.js (App Router, TypeScript, Zustand, Tailwind) trading UI: auth, a trade page (chart, book, trades, order entry, open orders, positions), and a wallet page (withdrawals).
+- `frontend` — minimal Next.js (App Router, TypeScript, Zustand, Tailwind) trading UI: auth, a trade page (chart, book + depth ladder, trades, order entry, open orders, positions), and a wallet page (withdrawals).
+- `tests` — integration test suite (`perp-integration-tests`, a separate workspace member) plus `tests/frontend` (Vitest) — see Testing below.
 
 ## Custodial account model
 
@@ -29,7 +30,9 @@ Every user gets their own deposit address, assigned atomically at signup:
 - `crates/seeder` derives 1,000 Solana keypairs from a single BIP39 mnemonic (`keys/mnemonic.txt`) using per-index derivation paths, and inserts the public keys into `deposit_addresses` as an unassigned pool.
 - `store::users::create_user_with_deposit_address` claims one of those addresses in the same transaction that creates the user row (`UPDATE ... WHERE pubkey = (SELECT ... FOR UPDATE SKIP LOCKED)`), so address assignment can't race or double-assign under concurrent signups.
 
-**Not implemented:** nothing currently watches the chain for incoming transfers to these addresses or credits `collateral_available` from them. The `deposits` table exists in the schema to record indexed deposits, but no indexer writes to it yet — deposit crediting is manual/future work.
+**Indexing:** `crates/worker/src/deposit_indexer.rs` polls `get_signatures_for_address` for every active deposit address every 10s, bounded by a per-address `deposit_addresses.last_signature` cursor so each poll only scans new signatures. For each new signature it diffs the account's pre/post lamport balance (not instruction parsing, so any transfer type that credits the account is caught) and, on a net-incoming transfer, calls `store::deposits::record_deposit` — one transaction that inserts the `deposits` row (`ON CONFLICT (signature) DO NOTHING`, the idempotency guard) and credits `collateral_available` only if that insert actually happened, so redelivery/restart-driven re-scans of the same signature are safe no-ops.
+
+**Sweeping:** `crates/worker/src/sweeper.rs` ticks every `SWEEP_INTERVAL_SECS` (default 60), re-derives all 1,000 deposit-address keypairs once at startup, and for each address with a balance above `SWEEP_MIN_LAMPORTS` (default 0.01 SOL) past the rent-exempt minimum, signs and sends a plain `system_instruction::transfer` from that deposit keypair to the fat wallet using a fresh blockhash. This is on-chain custody movement only — the ledger was already credited by the indexer, so a failed or delayed sweep never risks a user's balance, only leaves funds parked at the deposit address until the next tick. Deliberately not routed through the withdrawal nonce-account pool: deposit addresses are single-purpose and low-contention, so a plain blockhash transaction is sufficient.
 
 ## Withdrawals
 
@@ -74,9 +77,11 @@ The engine (`crates/engine`) is a separate process from `api`, matching orders i
 
 **Funding:** a 5-second sampler walks the book for the bid/ask VWAP that would fill `impact_notional`, computes the premium index against the mark price, and writes to the `funding_rate_samples` hypertable. Once per UTC hour, `mean_P` over the trailing window is turned into `FR_hour` per the standard 8-hour-formula-divided-by-8 approach and settled against every open position, credited/debited directly to `collateral_available` and tracked in `positions.funding_pnl` separately from trading PnL.
 
-**Liquidation:** margin health (`Equity` vs `MaintenanceMargin`) is polled every 3 seconds rather than recomputed synchronously on every fill — a deliberate simplification of "continuous". Cross evaluates an account's combined cross exposure; isolated evaluates one position independently. A flagged scope is blocked from new order intake (checked in-memory, no Postgres round-trip) and unwound with engine-generated reduce-only IOC orders. If the book can't absorb an unwind and equity has fallen to a small fraction of maintenance margin, the remaining position is transferred directly to the insurance-fund account instead (`backstop_equity_ratio`, per-market). Liquidation fills carry an extra `liquidation_fee_rate` surcharge on top of the normal taker rate.
+**Liquidation:** margin health (`Equity` vs `MaintenanceMargin`) is polled every 3 seconds rather than recomputed synchronously on every fill — a deliberate simplification of "continuous". Cross evaluates an account's combined cross exposure; isolated evaluates one position independently. For a flagged cross account with more than one open position, the largest-notional position (`|quantity| * mark_price`) is unwound first (`largest_notional_position` in `crates/engine/src/state.rs`), with the next tick picking up whatever's left. A flagged scope is blocked from new order intake (checked in-memory, no Postgres round-trip) and unwound with engine-generated reduce-only IOC orders. If the book can't absorb an unwind and equity has fallen to a small fraction of maintenance margin, the remaining position is transferred directly to the insurance-fund account instead (`backstop_equity_ratio`, per-market). Liquidation fills carry an extra `liquidation_fee_rate` surcharge on top of the normal taker rate.
 
-**Mark/index price:** the engine's own last-trade price, mirrored to `markets.mark_price` so `place_order` can size MARKET-order margin without depending on the engine being reachable. There is no external oracle in this codebase — this is a documented stub; Pyth would be the natural integration given the stack is already Solana-native.
+**Mark/index price:** two distinct prices are now tracked. `mark_price` is still the engine's own last-trade price, mirrored to `markets.mark_price` so `place_order` can size MARKET-order margin without depending on the engine being reachable; it also continues to feed liquidation/backstop math. `index_price` is new: `crates/engine/src/oracle.rs` polls Pyth's Hermes REST API every 3s for each market's configured `markets.pyth_price_feed_id` (seeded by `crates/seeder/src/bin/seed_markets.rs`) and feeds `state.index_prices` via `IntakeCommand::UpdateIndexPrice` — purely in-memory, never persisted, since it's re-fetched from Pyth within seconds of any restart. The funding sampler's premium-index calculation now reads `index_price` (the external oracle) rather than reusing `mark_price` for both roles, which is the textbook Index/Mark split for perp funding.
+
+**Order book depth:** `OrderBook::depth(levels)` (`crates/engine/src/book.rs`) returns the top N price levels per side, each summed to (price, total remaining quantity). It's published on its own `market:{SYMBOL}:depth` Redis channel (`publish_depth`) whenever a book mutates — new order, fill, or cancel, not just fills like the pre-existing `market:{SYMBOL}:book` top-of-book channel — and relayed by `ws-gateway` alongside `trades`/`book`/`ticker`. The frontend renders it as a depth ladder (`components/trade/OrderBookDepth.tsx`).
 
 **Crash recovery:** the match-loop task snapshots its full state (books, positions, fee/mark-price caches, event/trade id counters) to Postgres every 10 seconds. On restart it loads the latest snapshot and resumes — no replay from the event log — so at most ~10 seconds of activity is lost on a crash, a bound accepted up front rather than engineered around.
 
@@ -97,7 +102,7 @@ cargo run -p ws-gateway                   # WebSocket bridge for live market/ord
 cd frontend && cp .env.local.example .env.local && npm install && npm run dev  # trading UI, http://localhost:3002
 ```
 
-Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY` (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5); `DATABASE_URL`, `REDIS_URL`, `ENGINE_INTAKE_CONCURRENCY` (engine, default 2); `REDIS_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (ws-gateway, default `127.0.0.1:3001` — must share the same `JWT_SECRET` as `api`). `frontend/.env.local`: `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_WS_URL`.
+Env vars: `DATABASE_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (api); `SOLANA_RPC_URL`, `REDIS_URL`, `WORKER_CONCURRENCY`, `SWEEP_INTERVAL_SECS` (default 60), `SWEEP_MIN_LAMPORTS` (default 10_000_000, i.e. 0.01 SOL) (worker); `WITHDRAWAL_RATE_LIMIT_PER_DAY` (api, default 5); `DATABASE_URL`, `REDIS_URL`, `ENGINE_INTAKE_CONCURRENCY` (engine, default 2); `REDIS_URL`, `JWT_SECRET`, `SERVER_ADDRESS` (ws-gateway, default `127.0.0.1:3001` — must share the same `JWT_SECRET` as `api`). `frontend/.env.local`: `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_WS_URL`. The Pyth oracle poller has no configuration — it polls `https://hermes.pyth.network` for whichever markets have a non-null `markets.pyth_price_feed_id`.
 
 The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer agave/solana images require `io_uring`, which WSL2's kernel does not support, and `solana-test-validator` panics on startup there.
 
@@ -105,7 +110,7 @@ The local validator image is pinned to `solanalabs/solana:v1.18.26` — newer ag
 
 Everything above is built and passes its own layer of checks (`cargo check`/`clippy`, `tsc --noEmit`, `eslint`, `next build`), but wiring six live processes together (`postgres`, `redis`, `solana-test-validator`, `api`, `worker`, `engine`, `ws-gateway`, `frontend`) hasn't been exercised end-to-end against a live stack in this environment. To verify it yourself, after the steps above are all running:
 
-1. Open `http://localhost:3002`, sign up, and confirm you land on `/trade/SOL` with a nonzero deposit address assigned (check the `users`/`deposit_addresses` tables, or add a `GET /me` call — the UI shows balances in the navbar).
+1. Open `http://localhost:3002`, sign up, and confirm you land on `/trade/SOL` with a deposit address assigned (check the `users`/`deposit_addresses` tables, or the `GET /me` response — the UI shows balances in the navbar). Send SOL to that address from the local validator and confirm `collateral_available` increases within ~10s (`deposit_indexer`), then confirm the deposit address's on-chain balance drops back to ~rent-exempt minimum within the sweep interval (`sweeper`).
 2. Place a LIMIT order — confirm it appears in "Open orders", the navbar's `collateral_locked` increases, and a browser WS frame arrives on `/ws/user` (`ACCEPTED`/`RESTED`).
 3. From a second signed-up account, place a crossing order on the same market and confirm both sides show a `FILL` order event, "Positions" populates on both accounts, and the trade appears in the recent-trades feed on `/trade/SOL` (`market:SOL:trades` over `/ws/market/SOL`).
 4. Cancel a resting order — confirm `collateral_locked` is refunded back to `collateral_available`.
@@ -133,13 +138,19 @@ Bridges the engine's Redis Pub/Sub channels to browser clients — a thin relay 
 
 | Route | Auth | Forwards |
 |---|---|---|
-| `GET /ws/market/{symbol}` | none | `market:{SYMBOL}:trades\|book\|ticker` as `{"channel": "trades"\|"book"\|"ticker", "data": ...}` frames |
+| `GET /ws/market/{symbol}` | none | `market:{SYMBOL}:trades\|book\|ticker\|depth` as `{"channel": "trades"\|"book"\|"ticker"\|"depth", "data": ...}` frames |
 | `GET /ws/user?token=<jwt>` | JWT in query param (browsers can't set `Authorization` on a WS upgrade) | `user:{id}:orders` as `{"channel": "orders", "data": ...}` frames |
 
 ## Not yet built
 
-- Deposit indexing (crediting `collateral_available` from on-chain transfers)
-- Sweeping deposit-address balances into the fat wallet
-- External price oracle (mark/index price is currently the engine's own last-trade price — see Matching Engine)
-- Order book depth in the UI/gateway — the engine only publishes best bid/ask (`publish_book_top`), not full depth, so `/ws/market/{symbol}` and the frontend show top-of-book only
-- Cross liquidation currently unwinds the first open position it finds rather than largest-notional-first
+- Deposit-address balance reconciliation against a chain reorg/rollback (the indexer trusts `confirmed` commitment; a deeper reorg than that is not specially handled)
+- SPL-token deposits/withdrawals (native SOL only, throughout)
+- A UI affordance for oracle vs. book mark price divergence (the frontend shows `ticker.mark_price`; `index_price` isn't surfaced anywhere in the UI yet, only used internally by the funding sampler)
+
+## Testing
+
+- **Unit tests** (fast, no infra) are colocated as `#[cfg(test)] mod tests` in the crates whose pure logic they cover — e.g. `crates/engine/src/book.rs` (depth/VWAP math) and `crates/engine/src/state.rs` (cross-liquidation largest-notional selection, `crates/engine/src/oracle.rs` (Pyth price parsing). Run with `cargo test --workspace --exclude perp-integration-tests`.
+- **Integration tests** live in the top-level `tests/` directory (a separate Cargo workspace member, `perp-integration-tests`) and exercise `store::*` functions, the API router in-process (`api::build_app` + `tower::ServiceExt::oneshot`), and the ledger-application functions, all against a real Postgres (`sqlx::migrate!` runs the shared `migrations/` directory automatically). Run with `cargo test -p perp-integration-tests` against `docker compose up -d postgres redis`.
+- One integration test, `worker_deposit_withdrawal_e2e`, exercises the full airdrop → deposit-index → sweep → withdrawal round trip against a live `solana-test-validator`. It's `#[ignore]`d by default; run it explicitly with `cargo test -p perp-integration-tests -- --ignored` after `docker compose up -d solana-test-validator`.
+- **Frontend tests** live in `tests/frontend/` (Vitest + Testing Library), covering the WS hook's channel dispatch (including `depth`) and the order-book components. Run with `cd frontend && npm run test` (the script points Vitest at `../tests/frontend/vitest.config.ts`, so tests stay physically consolidated under `tests/` while still resolving `frontend/`'s `@/*` imports and `node_modules`).
+- `scripts/run-tests.sh` runs everything above in order against a fresh `docker compose` stack (`--with-validator` to include the Solana e2e suite too).

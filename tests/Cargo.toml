@@ -1,0 +1,23 @@
+[package]
+name = "perp-integration-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true, features = ["migrate"] }
+redis = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+axum = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+bip39 = { workspace = true }
+store = { path = "../crates/store" }
+api = { path = "../crates/api" }
+worker = { path = "../crates/worker" }

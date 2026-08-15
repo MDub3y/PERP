@@ -7,6 +7,10 @@ struct MarketConfig {
     tick_size: &'static str,
     lot_size: &'static str,
     max_leverage: i16,
+    /// Pyth Hermes price-feed id (hex, no "0x" prefix) - see
+    /// crates/engine/src/oracle.rs, which polls Hermes for these ids to
+    /// feed the funding sampler's external index price.
+    pyth_price_feed_id: &'static str,
 }
 
 /// Initial/maintenance margin rates are derived from max_leverage
@@ -18,18 +22,21 @@ const MARKETS: &[MarketConfig] = &[
         tick_size: "0.01",
         lot_size: "0.01",
         max_leverage: 20,
+        pyth_price_feed_id: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     },
     MarketConfig {
         market: "ETH",
         tick_size: "0.01",
         lot_size: "0.001",
         max_leverage: 20,
+        pyth_price_feed_id: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     },
     MarketConfig {
         market: "BTC",
         tick_size: "0.1",
         lot_size: "0.0001",
         max_leverage: 20,
+        pyth_price_feed_id: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
     },
 ];
 
@@ -49,14 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let maintenance_margin_rate = initial_margin_rate / Decimal::from(2);
 
         sqlx::query(
-            "INSERT INTO markets (market, tick_size, lot_size, max_leverage, initial_margin_rate, maintenance_margin_rate)
-             VALUES ($1::text::market_name, $2, $3, $4, $5, $6)
+            "INSERT INTO markets (market, tick_size, lot_size, max_leverage, initial_margin_rate, maintenance_margin_rate, pyth_price_feed_id)
+             VALUES ($1::text::market_name, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (market) DO UPDATE SET
                 tick_size = EXCLUDED.tick_size,
                 lot_size = EXCLUDED.lot_size,
                 max_leverage = EXCLUDED.max_leverage,
                 initial_margin_rate = EXCLUDED.initial_margin_rate,
-                maintenance_margin_rate = EXCLUDED.maintenance_margin_rate",
+                maintenance_margin_rate = EXCLUDED.maintenance_margin_rate,
+                pyth_price_feed_id = EXCLUDED.pyth_price_feed_id",
         )
         .bind(m.market)
         .bind(m.tick_size.parse::<Decimal>()?)
@@ -64,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(m.max_leverage)
         .bind(initial_margin_rate)
         .bind(maintenance_margin_rate)
+        .bind(m.pyth_price_feed_id)
         .execute(&pool)
         .await?;
 

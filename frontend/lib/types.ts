@@ -138,6 +138,12 @@ export interface TickerMessage {
   mark_price: number;
 }
 
+/** Top N price levels per side, each (price, total remaining quantity). */
+export interface DepthMessage {
+  bids: [number, number][];
+  asks: [number, number][];
+}
+
 export interface UserOrderMessage {
   event_type: "ACCEPTED" | "RESTED" | "CANCELED" | "REJECTED" | "FILL";
   order_id: number;
@@ -147,6 +153,7 @@ export interface UserOrderMessage {
 export type MarketWsFrame =
   | { channel: "trades"; data: TradeMessage }
   | { channel: "book"; data: BookTopMessage }
-  | { channel: "ticker"; data: TickerMessage };
+  | { channel: "ticker"; data: TickerMessage }
+  | { channel: "depth"; data: DepthMessage };
 
 export type UserWsFrame = { channel: "orders"; data: UserOrderMessage };

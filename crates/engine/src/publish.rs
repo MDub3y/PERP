@@ -1,3 +1,4 @@
+use crate::book::DepthLevel;
 use redis::AsyncCommands;
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -51,6 +52,20 @@ pub async fn publish_book_top(
 ) {
     let channel = format!("market:{}:book", market_str(market));
     let payload = json!({ "best_bid": best_bid, "best_ask": best_ask }).to_string();
+    let _: redis::RedisResult<i64> = conn.publish(channel, payload).await;
+}
+
+/// Full order-book depth (top N levels per side), on its own channel -
+/// separate from `publish_book_top` per the existing one-channel-per-concern
+/// pattern (trades/ticker/book are already split).
+pub async fn publish_depth(
+    conn: &mut redis::aio::MultiplexedConnection,
+    market: MarketSymbol,
+    bids: &[DepthLevel],
+    asks: &[DepthLevel],
+) {
+    let channel = format!("market:{}:depth", market_str(market));
+    let payload = json!({ "bids": bids, "asks": asks }).to_string();
     let _: redis::RedisResult<i64> = conn.publish(channel, payload).await;
 }
 

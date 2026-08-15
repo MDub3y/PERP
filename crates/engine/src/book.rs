@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use store::models::{MarginMode, OrderVariant};
 
+/// (price, total remaining quantity) at one book level.
+pub type DepthLevel = (Decimal, Decimal);
+
 // leverage/margin_mode/reduce_only/is_liquidation aren't read by the match
 // loop yet - they're what the liquidation subsystem (a later phase) scans
 // the book for (e.g. to skip matching against another account's own
@@ -88,6 +91,26 @@ impl OrderBook {
         side.entry(order.price).or_default().push_back(order);
     }
 
+    /// Top `levels` price levels per side, each summed to (price, total
+    /// remaining quantity resting at that price) - same per-level summation
+    /// `impact_vwap` already does, just without the notional-walk cutoff.
+    pub fn depth(&self, levels: usize) -> (Vec<DepthLevel>, Vec<DepthLevel>) {
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(levels)
+            .map(|(&price, level)| (price, level.iter().map(|o| o.remaining).sum()))
+            .collect();
+        let asks = self
+            .asks
+            .iter()
+            .take(levels)
+            .map(|(&price, level)| (price, level.iter().map(|o| o.remaining).sum()))
+            .collect();
+        (bids, asks)
+    }
+
     pub fn remove_by_id(&mut self, order_id: i64) -> Option<RestingOrder> {
         let (variant, price) = self.by_id.remove(&order_id)?;
         let side = match variant {
@@ -148,5 +171,86 @@ mod decimal_keyed_map {
     ) -> Result<BTreeMap<Decimal, VecDeque<RestingOrder>>, D::Error> {
         let entries = Vec::<(Decimal, VecDeque<RestingOrder>)>::deserialize(deserializer)?;
         Ok(entries.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn resting(order_id: i64, variant: OrderVariant, price: Decimal, remaining: Decimal) -> RestingOrder {
+        RestingOrder {
+            order_id,
+            user_id: 1,
+            variant,
+            price,
+            remaining,
+            leverage: 1,
+            margin_mode: MarginMode::Cross,
+            reduce_only: false,
+            is_liquidation: false,
+        }
+    }
+
+    #[test]
+    fn depth_empty_book_returns_empty_vecs() {
+        let book = OrderBook::new();
+        let (bids, asks) = book.depth(10);
+        assert!(bids.is_empty());
+        assert!(asks.is_empty());
+    }
+
+    #[test]
+    fn depth_single_level_sums_quantity_at_price() {
+        let mut book = OrderBook::new();
+        book.insert_resting(resting(1, OrderVariant::Long, d("100"), d("2")));
+        book.insert_resting(resting(2, OrderVariant::Long, d("100"), d("3")));
+        let (bids, asks) = book.depth(10);
+        assert_eq!(bids, vec![(d("100"), d("5"))]);
+        assert!(asks.is_empty());
+    }
+
+    #[test]
+    fn depth_orders_bids_desc_and_asks_asc_and_respects_levels_cap() {
+        let mut book = OrderBook::new();
+        for (id, price) in [(1, d("99")), (2, d("100")), (3, d("101"))] {
+            book.insert_resting(resting(id, OrderVariant::Long, price, d("1")));
+        }
+        for (id, price) in [(4, d("102")), (5, d("103")), (6, d("104"))] {
+            book.insert_resting(resting(id, OrderVariant::Short, price, d("1")));
+        }
+        let (bids, asks) = book.depth(2);
+        assert_eq!(bids, vec![(d("101"), d("1")), (d("100"), d("1"))]);
+        assert_eq!(asks, vec![(d("102"), d("1")), (d("103"), d("1"))]);
+    }
+
+    #[test]
+    fn impact_vwap_empty_book_returns_none() {
+        let book = OrderBook::new();
+        assert_eq!(book.bid_impact_vwap(d("1000")), None);
+        assert_eq!(book.ask_impact_vwap(d("1000")), None);
+    }
+
+    #[test]
+    fn impact_vwap_insufficient_liquidity_returns_none() {
+        let mut book = OrderBook::new();
+        book.insert_resting(resting(1, OrderVariant::Short, d("100"), d("1")));
+        // Only 100 notional available on the ask side; asking for 1000 can't be filled.
+        assert_eq!(book.ask_impact_vwap(d("1000")), None);
+    }
+
+    #[test]
+    fn impact_vwap_partial_level_computes_correct_average() {
+        let mut book = OrderBook::new();
+        book.insert_resting(resting(1, OrderVariant::Short, d("100"), d("10")));
+        book.insert_resting(resting(2, OrderVariant::Short, d("110"), d("10")));
+        // Fill 1050 notional: all of level 100 (1000 notional, qty 10) plus 50/110 at level 110.
+        let vwap = book.ask_impact_vwap(d("1050")).unwrap();
+        let expected = d("1050") / (d("10") + d("50") / d("110"));
+        assert_eq!(vwap, expected);
     }
 }

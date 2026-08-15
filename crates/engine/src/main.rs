@@ -20,6 +20,7 @@ mod intake;
 mod ledger_writer;
 mod liquidation_scheduler;
 mod matcher;
+mod oracle;
 mod publish;
 mod relay;
 mod state;
@@ -79,7 +80,18 @@ async fn main() {
     handles.push(tokio::spawn(funding_scheduler::run_funding_settlement_scheduler(tx.clone())));
     handles.push(tokio::spawn(liquidation_scheduler::run_liquidation_scheduler(tx.clone())));
 
-    drop(tx); // match-loop's rx closes once every clone (intake + schedulers) drops
+    let oracle_markets = store::markets::fetch_all_markets(&pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to load markets for oracle poller: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|m| m.pyth_price_feed_id.map(|feed_id| (m.market, feed_id)))
+        .collect();
+    handles.push(tokio::spawn(oracle::run_oracle_poller(tx.clone(), oracle_markets)));
+
+    drop(tx); // match-loop's rx closes once every clone (intake + schedulers + oracle) drops
 
     handles.push(tokio::spawn(state::run_match_loop(
         pool.clone(),

@@ -31,6 +31,7 @@ async fn handle_socket(state: AppState, symbol: String, socket: WebSocket) {
         format!("market:{symbol}:trades"),
         format!("market:{symbol}:book"),
         format!("market:{symbol}:ticker"),
+        format!("market:{symbol}:depth"),
     ];
     pubsub::relay(&state.redis_client, &channels, socket).await;
 }

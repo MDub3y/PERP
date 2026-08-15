@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useAuthStore } from "@/store/auth";
 import type {
   BookTopMessage,
+  DepthMessage,
   MarketSymbol,
   MarketWsFrame,
   TickerMessage,
@@ -21,6 +22,7 @@ const RECONNECT_DELAY_MS = 2000;
 export function useMarketSocket(market: MarketSymbol) {
   const [bookTop, setBookTop] = useState<BookTopMessage | null>(null);
   const [ticker, setTicker] = useState<TickerMessage | null>(null);
+  const [depth, setDepth] = useState<DepthMessage | null>(null);
   const [trades, setTrades] = useState<TradeMessage[]>([]);
   const [connected, setConnected] = useState(false);
 
@@ -32,6 +34,7 @@ export function useMarketSocket(market: MarketSymbol) {
     setPrevMarket(market);
     setBookTop(null);
     setTicker(null);
+    setDepth(null);
     setTrades([]);
   }
 
@@ -61,6 +64,7 @@ export function useMarketSocket(market: MarketSymbol) {
         }
         if (frame.channel === "book") setBookTop(frame.data);
         else if (frame.channel === "ticker") setTicker(frame.data);
+        else if (frame.channel === "depth") setDepth(frame.data);
         else if (frame.channel === "trades") {
           setTrades((prev) => [frame.data, ...prev].slice(0, MAX_TRADES));
         }
@@ -76,7 +80,7 @@ export function useMarketSocket(market: MarketSymbol) {
     };
   }, [market]);
 
-  return { bookTop, ticker, trades, connected };
+  return { bookTop, ticker, depth, trades, connected };
 }
 
 /** Live per-user order lifecycle feed (ACCEPTED/RESTED/CANCELED/REJECTED/FILL). */

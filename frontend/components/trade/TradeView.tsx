@@ -8,6 +8,7 @@ import { useMarketSocket, useUserSocket } from "@/lib/ws";
 import type { MarketSymbol, UserOrderMessage } from "@/lib/types";
 import { PriceChart } from "@/components/trade/PriceChart";
 import { OrderBookTop } from "@/components/trade/OrderBookTop";
+import { OrderBookDepth } from "@/components/trade/OrderBookDepth";
 import { RecentTrades } from "@/components/trade/RecentTrades";
 import { OrderForm } from "@/components/trade/OrderForm";
 import { OpenOrders } from "@/components/trade/OpenOrders";
@@ -30,7 +31,7 @@ export function TradeView({ market }: { market: MarketSymbol }) {
   const { data: markets = [] } = useQuery({ queryKey: ["markets"], queryFn: getMarkets });
   const marketConfig = markets.find((m) => m.market === market);
 
-  const { bookTop, ticker, trades } = useMarketSocket(market);
+  const { bookTop, ticker, depth, trades } = useMarketSocket(market);
 
   useUserSocket((event) => {
     const label = EVENT_LABEL[event.event_type] ?? event.event_type;
@@ -83,6 +84,7 @@ export function TradeView({ market }: { market: MarketSymbol }) {
 
         <div className="flex flex-col gap-4">
           <OrderBookTop bookTop={bookTop} />
+          <OrderBookDepth depth={depth} />
           <RecentTrades trades={trades} />
         </div>
 

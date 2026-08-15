@@ -1308,6 +1308,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "redis",
+ "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -2834,6 +2835,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd23b938276f14057220b707937bcb42fa76dda7560e57a2da30cb52d557937"
 dependencies = [
  "num",
+]
+
+[[package]]
+name = "perp-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "api",
+ "axum",
+ "bip39",
+ "chrono",
+ "http-body-util",
+ "jsonwebtoken",
+ "redis",
+ "rust_decimal",
+ "serde_json",
+ "solana-client",
+ "solana-sdk",
+ "sqlx",
+ "store",
+ "tokio",
+ "tower",
+ "worker",
 ]
 
 [[package]]
